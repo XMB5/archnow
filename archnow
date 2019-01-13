@@ -1,0 +1,297 @@
+#!/usr/bin/env bash
+
+#        Archnow, a simple arch linux installer
+#        Copyright (C) 2019 Sam Foxman
+
+#        This program is free software: you can redistribute it and/or modify
+#        it under the terms of the GNU General Public License as published by
+#        the Free Software Foundation, either version 3 of the License, or
+#        (at your option) any later version.
+
+#        This program is distributed in the hope that it will be useful,
+#        but WITHOUT ANY WARRANTY; without even the implied warranty of
+#        MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#        GNU General Public License for more details.
+
+#        You should have received a copy of the GNU General Public License
+#        along with this program.  If not, see <https://www.gnu.org/licenses/>.
+
+set -e
+
+loadstrings(){
+  apptitle='archnow'
+  txtautoparts='Auto Partitions'
+  txtsethostname='Set Computer Name'
+  txtautopartclear='Clear all partition data'
+  txtautopartcreate='Create %1 partition'
+  txtformatingpart='Formatting partition %1 as'
+  txtchooseusername='Choose a username'
+  txtsetpassword='Set password for %1'
+  txtconfirmpassword='Confirm password'
+}
+
+archchrootsetup(){
+  cp $0 /mnt/root
+  chmod 755 /mnt/root/$(basename "$0")
+}
+
+archchroot(){
+  arch-chroot /mnt /root/$(basename "$0") --chroot "$@"
+}
+
+archchrootteardown(){
+  rm /mnt/root/$(basename "$0")
+}
+
+askinfo() {
+  items="$(lsblk -d -p -n -l -o NAME,MODEL -e 7,11)"
+  options=()
+  while read -r line; do
+    options+=($line)
+  done <<< "$items"
+  device=$(whiptail --backtitle "$apptitle" --title "$txtautoparts (gpt)" --menu "" 0 0 0 "${options[@]}" 3>&1 1>&2 2>&3)
+  hostname=$(whiptail --backtitle "$apptitle" --title "$txtsethostname" --inputbox "" 0 0 "archlinux" 3>&1 1>&2 2>&3)
+  username=$(whiptail --backtitle "$apptitle" --title "$txtchooseusername" --inputbox "" 0 0 3>&1 1>&2 2>&3)
+  password=$(whiptail --backtitle "$apptitle" --title "${txtsetpassword//%1/$username}" --passwordbox "" 7 0 3>&1 1>&2 2>&3)
+  password2=$(whiptail --backtitle "$apptitle" --title "$txtconfirmpassword" --passwordbox "" 7 0 3>&1 1>&2 2>&3)
+  clear
+  if [ "$password" != "$password2" ]; then
+    echo "passwords didn't match"
+    exit 4
+  fi
+}
+
+diskpartautogpt(){
+  echo "$txtautopartclear"
+  parted -s $device mklabel gpt
+  echo "${txtautopartcreate//%1/BIOS boot}"
+  sgdisk $device -n=1:0:+31M -t=1:ef02
+  echo "${txtautopartcreate//%1/boot}"
+  sgdisk $device -n=2:0:+512M
+  echo "${txtautopartcreate//%1/swap}"
+  swapsize=$(cat /proc/meminfo | grep MemTotal | awk '{ print $2 }')
+  swapsize=$(($swapsize/1000))"M"
+  sgdisk $device -n=3:0:+$swapsize -t=3:8200
+  echo "${txtautopartcreate//%1/root}"
+  sgdisk $device -n=4:0:0
+  bootdev=$device"2"
+  swapdev=$device"3"
+  rootdev=$device"4"
+  efimode="0"
+}
+
+formatdevices(){
+  formatbootdevice $bootdev
+  formatswapdevice $swapdev
+  formatdevice $rootdev
+}
+
+formatbootdevice(){
+  sel=ext4
+  echo "${txtformatingpart//%1/$1} $sel"
+  echo "----------------------------------------------"
+  mkfs.ext4 -F $1
+}
+
+formatswapdevice(){
+  echo "${txtformatingpart//%1/$1} swap"
+  echo "----------------------------------------------------"
+  mkswap $1
+}
+
+formatdevice(){
+  sel=btrfs
+  echo "${txtformatingpart//%1/$1} $sel"
+  echo "----------------------------------------------"
+  mkfs.btrfs -f $1
+}
+
+mountparts(){
+  echo 'mount partitions'
+  mount $rootdev /mnt
+  btrfs subvolume create /mnt/home
+  mkdir /mnt/{boot,root}
+  mount $bootdev /mnt/boot
+  swapon $swapdev
+}
+
+archconfigusers(){
+  archchroot configusers "$username" "$password"
+}
+
+archconfiguserschroot(){
+  echo 'config users'
+  chsh -s /usr/bin/zsh
+  useradd -D --shell /usr/bin/zsh
+  useradd --create-home --groups wheel "$1"
+  chpasswd <<< "$1:$2"
+  sed -i -e 's/^# %wheel ALL=(ALL) ALL/%wheel ALL=(ALL) ALL/' /etc/sudoers
+  passwd -l root
+}
+
+findfastestmirrors(){
+  echo 'finding fastest mirrors'
+  wget https://xyne.archlinux.ca/projects/reflector/src/reflector-2018.tar.xz -O- | tar xJ
+  cd reflector-2018
+  ./reflector -f 6 -a 12 --verbose --save /etc/pacman.d/mirrorlist
+  cd ..
+  rm -rf reflector-2018
+}
+
+installbase(){
+  echo 'install base'
+  pacstrap /mnt openssh btrfs-progs base base-devel git go grub zsh grml-zsh-config
+}
+
+installyay(){
+  archchroot installyay
+}
+
+installyaychroot(){
+  echo 'install yay'
+  cd /tmp
+  #cannot makepkg as root
+  sudo -u nobody bash << EOF
+  mkdir builder
+  cd builder
+  git clone https://aur.archlinux.org/yay.git
+  cd yay
+  HOME=/tmp/builder PKGEXT='.pkg.tar' makepkg
+EOF
+  cd builder/yay
+  pacman -U yay-*.pkg.tar --noconfirm
+  cd ../..
+  rm -rf builder
+}
+
+archsethostname(){
+  echo 'set hostname'
+  echo "$hostname" > /mnt/etc/hostname
+}
+
+archsetkeymap(){
+  echo 'set keymap'
+  echo "KEYMAP=us" > /mnt/etc/vconsole.conf
+}
+
+archsetlocale(){
+  echo 'set locale'
+  locale=en_US
+  echo "LANG=$locale.UTF-8" > /mnt/etc/locale.conf
+  echo 'LC_COLLATE=C' >> /mnt/etc/locale.conf
+  sed -i '/'$locale'.UTF-8/s/^#//g' /mnt/etc/locale.gen
+  archchroot setlocale
+}
+
+archsetlocalechroot(){
+  echo 'generate locale'
+  locale-gen
+}
+
+archsettime(){
+  echo 'set timezone'
+  timezone=America/New_York
+  ln -sf /usr/share/zoneinfo/$timezone /mnt/etc/localtime
+  archchroot settimeutc
+}
+
+archsettimeutcchroot(){
+  echo 'use hardware clock'
+  hwclock --systohc --utc
+}
+
+archgenfstab(){
+  echo 'generate fstab'
+  genfstab /mnt > /mnt/etc/fstab
+}
+
+archgrubmkconfig(){
+  archchroot grubmkconfig
+}
+
+archgrubmkconfigchroot(){
+  echo 'create grub config'
+  sed -i -e 's/^GRUB_TIMEOUT=.*$/GRUB_TIMEOUT=0/' /etc/default/grub
+  mkdir /boot/grub
+  grub-mkconfig -o /boot/grub/grub.cfg
+}
+
+archgrubinstallbootloader(){
+  archchroot grubbootloaderinstall $device
+}
+
+archgrubinstallbootloaderchroot(){
+  echo 'install grub'
+  grub-install --target=i386-pc --recheck $1
+}
+
+archenabledhcpcd(){
+  archchroot enable dhcpcd
+}
+
+archconfssh(){
+  echo 'configure ssh'
+  echo '#!/bin/bash
+echo '\''preventing ssh password authentication'\''
+sudo sed -i -e '\''s/^#PasswordAuthentication yes$/PasswordAuthentication no/'\'' /etc/ssh/sshd_config
+echo '\''restarting sshd'\''
+sudo systemctl restart sshd
+echo '\''deleting ssh-secure'\''
+rm /usr/bin/ssh-secure' > /mnt/usr/bin/ssh-secure
+  chmod +x /mnt/usr/bin/ssh-secure
+  archchroot enable sshd
+}
+
+archenablechroot(){
+  echo "enable $1"
+  systemctl enable "$1"
+}
+
+unmountdevices(){
+  echo 'unmount devices'
+  umount -R /mnt
+  swapoff $swapdev
+}
+
+ejectpoweroff(){
+  echo 'eject and power off'
+  set +e
+  eject -m
+  #reboot binary unavailable after ejecting disk, so we use the shell builtin and kernel feature
+  echo b > /proc/sysrq-trigger
+}
+
+if [ "$1" = '--chroot' ]; then
+  case $2 in
+    'configusers') archconfiguserschroot "$3" "$4";;
+    'installyay') installyaychroot;;
+    'setlocale') archsetlocalechroot;;
+    'settimeutc') archsettimeutcchroot;;
+    'enable') archenablechroot "$3";;
+    'grubmkconfig') archgrubmkconfigchroot;;
+    'grubbootloaderinstall') archgrubinstallbootloaderchroot "$3";;
+  esac
+else
+  loadstrings
+  askinfo
+  diskpartautogpt
+  formatdevices
+  mountparts
+  findfastestmirrors
+  installbase
+  archchrootsetup
+  installyay
+  archsethostname
+  archsetkeymap
+  archsetlocale
+  archsettime
+  archconfigusers
+  archgenfstab
+  archgrubmkconfig
+  archgrubinstallbootloader
+  archenabledhcpcd
+  archconfssh
+  archchrootteardown
+  unmountdevices
+  ejectpoweroff
+fi
