@@ -18,7 +18,7 @@ It asks 4 questions:
 
 ## Caveats
 - designed to work in VirtualBox only
-- it will probably fail on a real device
+  - it won't work on a real machine
 - requires an internet connection
 
 ## How to use
