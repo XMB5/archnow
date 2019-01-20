@@ -88,10 +88,10 @@ formatdevices(){
 }
 
 formatbootdevice(){
-  sel=ext4
+  sel=fat32
   echo "${txtformatingpart//%1/$1} $sel"
   echo "----------------------------------------------"
-  mkfs.ext4 -F $1
+  mkfs.fat -F32 $1
 }
 
 formatswapdevice(){
